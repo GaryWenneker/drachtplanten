@@ -518,24 +518,30 @@ Write-Host ""
 # --- Stap 4: Deploy pre-built ---
 Write-Host "Stap 4: Deploy pre-built (.netlify\static + .netlify\functions)" -ForegroundColor Yellow
 
-# Unlock auto-publishing BEFORE deploying.
-# When a previous deploy was locked (stap 5), the next "netlify deploy --prod" will
-# show an interactive "Would you like to unlock?" prompt.  Piping "echo y |" via
-# cmd /c suppresses the prompt but also pipes a character into the Netlify Blobs
-# upload authentication flow, which causes a 401 error.
-# Unlocking explicitly via the API avoids the prompt entirely, so we can run the
-# deploy command directly in PowerShell without any stdin pipe.
-Write-Host "  [4-pre] Unlock auto-publishing (verwijder eventuele deploy lock)" -ForegroundColor DarkGray
+# Unlock the current production deploy BEFORE deploying.
+# When a previous deploy was locked (stap 5), "netlify deploy --prod" shows an
+# interactive prompt.  Piping "echo y |" via cmd /c suppresses the prompt but
+# also feeds a character into the Netlify Blobs upload auth, causing HTTP 401.
+# Instead: fetch the latest production deploy ID via the API and unlock it
+# directly, so the deploy command can run without any stdin interaction.
+Write-Host "  [4-pre] Unlock eventuele productie-lock via API" -ForegroundColor DarkGray
 $siteId = "9341f8ad-20ab-43cc-a66b-3309f4b64405"
-$unlockResult = netlify api enableAutoPublishing --data "{`"site_id`":`"$siteId`"}" 2>&1
-if ($unlockResult -match '"name"') {
-    Write-Host "  [4-pre] OK: deploy ontgrendeld (auto-publishing ingeschakeld)" -ForegroundColor Green
-} else {
-    Write-Host "  [4-pre] WAARSCHUWING: unlock-resultaat onverwacht: $unlockResult" -ForegroundColor Yellow
+try {
+    $deploysRaw = netlify api listSiteDeploys --data "{`"site_id`":`"$siteId`",`"per_page`":1}" 2>&1
+    $deploysJson = ($deploysRaw | Where-Object { $_ -notmatch "^node\.exe|^At C:\\|CategoryInfo|FullyQualified" }) -join ""
+    $deploys = $deploysJson | ConvertFrom-Json -ErrorAction SilentlyContinue
+    if ($deploys -and $deploys.Count -gt 0 -and $deploys[0].locked -eq $true) {
+        $lockedId = $deploys[0].id
+        $null = netlify api unlockDeploy --data "{`"deploy_id`":`"$lockedId`"}" 2>&1
+        Write-Host "  [4-pre] OK: deploy $lockedId ontgrendeld" -ForegroundColor Green
+    } else {
+        Write-Host "  [4-pre] Geen locked deploy gevonden (skip)" -ForegroundColor DarkGray
+    }
+} catch {
+    Write-Host "  [4-pre] WAARSCHUWING: unlock check mislukt: $_" -ForegroundColor Yellow
 }
 
 # Run netlify deploy directly in PowerShell (no cmd /c, no stdin pipe).
-# Capturing $deployOutputStr by joining all output lines.
 Set-Location $projectRoot
 $deployRawOutput = netlify deploy --prod --no-build --dir ".netlify\static" --functions ".netlify\functions" --skip-functions-cache 2>&1
 $deployOutputStr = ($deployRawOutput | ForEach-Object { $_.ToString() }) -join "`n"
