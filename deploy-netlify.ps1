@@ -533,21 +533,23 @@ foreach ($lid in $knownLockedDeployIds) {
 }
 
 # Run netlify deploy directly in PowerShell (no cmd /c, no stdin pipe).
+# The Netlify CLI writes progress spinners to stderr; PowerShell with
+# $ErrorActionPreference="Stop" treats any native-command stderr as a fatal
+# error. Temporarily switch to Continue so stderr lines become warnings only.
 Set-Location $projectRoot
+$prevEAPDeploy = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
 $deployRawOutput = netlify deploy --prod --no-build --dir ".netlify\static" --functions ".netlify\functions" --skip-functions-cache 2>&1
+$deployExitCode = $LASTEXITCODE
+$ErrorActionPreference = $prevEAPDeploy
 $deployOutputStr = ($deployRawOutput | ForEach-Object { $_.ToString() }) -join "`n"
-
-if ([string]::IsNullOrWhiteSpace($deployOutputStr)) {
-    Write-Host "ERROR: Geen deploy-output ontvangen" -ForegroundColor Red
-    exit 1
-}
 
 Write-Host ""
 Write-Host $deployOutputStr
 Write-Host ""
 
-if ($deployOutputStr -notmatch "Deploy (complete|is live)" -and $deployOutputStr -notmatch "Production deploy is live") {
-    Write-Host "ERROR: Deploy mislukt (zie output hierboven)" -ForegroundColor Red
+if ($deployExitCode -ne 0) {
+    Write-Host "ERROR: Deploy mislukt (exit $deployExitCode)" -ForegroundColor Red
     exit 1
 }
 
