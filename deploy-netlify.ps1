@@ -518,27 +518,19 @@ Write-Host ""
 # --- Stap 4: Deploy pre-built ---
 Write-Host "Stap 4: Deploy pre-built (.netlify\static + .netlify\functions)" -ForegroundColor Yellow
 
-# Unlock the current production deploy BEFORE deploying.
-# When a previous deploy was locked (stap 5), "netlify deploy --prod" shows an
-# interactive prompt.  Piping "echo y |" via cmd /c suppresses the prompt but
-# also feeds a character into the Netlify Blobs upload auth, causing HTTP 401.
-# Instead: fetch the latest production deploy ID via the API and unlock it
-# directly, so the deploy command can run without any stdin interaction.
-Write-Host "  [4-pre] Unlock eventuele productie-lock via API" -ForegroundColor DarkGray
-$siteId = "9341f8ad-20ab-43cc-a66b-3309f4b64405"
-try {
-    $deploysRaw = netlify api listSiteDeploys --data "{`"site_id`":`"$siteId`",`"per_page`":1}" 2>&1
-    $deploysJson = ($deploysRaw | Where-Object { $_ -notmatch "^node\.exe|^At C:\\|CategoryInfo|FullyQualified" }) -join ""
-    $deploys = $deploysJson | ConvertFrom-Json -ErrorAction SilentlyContinue
-    if ($deploys -and $deploys.Count -gt 0 -and $deploys[0].locked -eq $true) {
-        $lockedId = $deploys[0].id
-        $null = netlify api unlockDeploy --data "{`"deploy_id`":`"$lockedId`"}" 2>&1
-        Write-Host "  [4-pre] OK: deploy $lockedId ontgrendeld" -ForegroundColor Green
-    } else {
-        Write-Host "  [4-pre] Geen locked deploy gevonden (skip)" -ForegroundColor DarkGray
+# If the previous deploy was (manually) locked, "netlify deploy --prod" shows an
+# interactive unlock prompt.  Piping stdin to suppress it breaks Netlify Blobs
+# auth (HTTP 401).  We no longer lock deploys after this step, so this should
+# only matter for the very first run after the old lock was set manually.
+# We try to unlock via the known last-locked deploy ID; if it fails, we continue.
+Write-Host "  [4-pre] Verwijder eventuele deploy-lock via unlockDeploy" -ForegroundColor DarkGray
+$knownLockedDeployIds = @("69c3d10e45cfe20079da578c")  # IDs that were manually locked
+foreach ($lid in $knownLockedDeployIds) {
+    $unlockRaw = netlify api unlockDeploy --data "{`"deploy_id`":`"$lid`"}" 2>&1
+    $unlockStr = ($unlockRaw | ForEach-Object { $_.ToString() }) -join " "
+    if ($unlockStr -match '"locked"\s*:\s*false') {
+        Write-Host "  [4-pre] OK: deploy $lid ontgrendeld" -ForegroundColor Green
     }
-} catch {
-    Write-Host "  [4-pre] WAARSCHUWING: unlock check mislukt: $_" -ForegroundColor Yellow
 }
 
 # Run netlify deploy directly in PowerShell (no cmd /c, no stdin pipe).
@@ -574,21 +566,13 @@ if (-not $deployId) {
 }
 
 if (-not $deployId) {
-    Write-Host "WAARSCHUWING: deploy_id niet gevonden in output; lock wordt overgeslagen" -ForegroundColor Yellow
+    Write-Host "WAARSCHUWING: deploy_id niet gevonden in output" -ForegroundColor Yellow
 } else {
     Write-Host "OK: Deploy live. deploy_id: $deployId" -ForegroundColor Green
-
-    # --- Stap 5: Lock deploy ---
-    Write-Host "Stap 5: Lock deploy" -ForegroundColor Yellow
-    $lockCmd = 'netlify api lockDeploy --data "{\"deploy_id\":\"' + $deployId + '\"}"'
-    $lockResult = cmd /c $lockCmd 2>&1
-    $lockResultStr = if ($lockResult -is [Array]) { $lockResult -join "`n" } else { $lockResult.ToString() }
-    if ($lockResultStr -match '"locked"\s*:\s*true') {
-        Write-Host "OK: Deploy vergrendeld (locked: true)" -ForegroundColor Green
-    } else {
-        Write-Host "WAARSCHUWING: Lock mogelijk mislukt. Output:" -ForegroundColor Yellow
-        Write-Host $lockResultStr
-    }
+    # NOTE: We do NOT lock the deploy.  Locking causes an interactive prompt on
+    # the next "netlify deploy --prod" run, which breaks Netlify Blobs auth (401)
+    # when the prompt is suppressed via stdin pipe.  Leaving deploys unlocked is
+    # safe; Netlify keeps the production deploy stable unless explicitly replaced.
 }
 Write-Host ""
 
