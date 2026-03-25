@@ -518,19 +518,18 @@ Write-Host ""
 # --- Stap 4: Deploy pre-built ---
 Write-Host "Stap 4: Deploy pre-built (.netlify\static + .netlify\functions)" -ForegroundColor Yellow
 
-# If the previous deploy was (manually) locked, "netlify deploy --prod" shows an
-# interactive unlock prompt.  Piping stdin to suppress it breaks Netlify Blobs
-# auth (HTTP 401).  We no longer lock deploys after this step, so this should
-# only matter for the very first run after the old lock was set manually.
-# We try to unlock via the known last-locked deploy ID; if it fails, we continue.
-Write-Host "  [4-pre] Verwijder eventuele deploy-lock via unlockDeploy" -ForegroundColor DarkGray
-$knownLockedDeployIds = @("69c3d10e45cfe20079da578c")  # IDs that were manually locked
+# We no longer lock deploys after this step (removed lockDeploy from stap 5).
+# The interactive unlock prompt therefore never appears in normal runs.
+# For safety, if a legacy lock exists, remove it via cmd /c so PowerShell does
+# not mangle the JSON quotes passed to the Netlify CLI.
+Write-Host "  [4-pre] Verwijder eventuele legacy deploy-lock" -ForegroundColor DarkGray
+$knownLockedDeployIds = @("69c3d10e45cfe20079da578c")
 foreach ($lid in $knownLockedDeployIds) {
-    $unlockRaw = netlify api unlockDeploy --data "{`"deploy_id`":`"$lid`"}" 2>&1
-    $unlockStr = ($unlockRaw | ForEach-Object { $_.ToString() }) -join " "
+    $unlockStr = (cmd /c "netlify api unlockDeploy --data `"{`\`"deploy_id`\`":`\`"$lid`\`"}`"" 2>&1) -join " "
     if ($unlockStr -match '"locked"\s*:\s*false') {
-        Write-Host "  [4-pre] OK: deploy $lid ontgrendeld" -ForegroundColor Green
+        Write-Host "  [4-pre] OK: legacy deploy $lid ontgrendeld" -ForegroundColor Green
     }
+    # Silently ignore errors — the deploy may already be unlocked or superseded
 }
 
 # Run netlify deploy directly in PowerShell (no cmd /c, no stdin pipe).
