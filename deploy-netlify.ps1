@@ -228,19 +228,41 @@ if (-not $SkipBuild) {
     }
     Write-Host "  [2A] OK: npm build geslaagd (.next\standalone\ aangemaakt)" -ForegroundColor Green
 
-    # --- 2A-post: Kopieer public/ naar .next/standalone/public/ ---
+    # --- 2A-post: Kopieer kleine public/ assets naar .next/standalone/public/ ---
     # Next.js standalone kopieert public/ NIET automatisch. De @netlify/plugin-nextjs
-    # assembleert de Lambda vanuit .next/standalone/ - zonder public/ kunnen
-    # next/image optimalisatie en directe bestandsrequests (bijv. /honeybee.png)
-    # NIET worden afgehandeld door de Lambda.
+    # assembleert de Lambda vanuit .next/standalone/ - kleine assets (favicon, og-image, robots.txt)
+    # moeten aanwezig zijn zodat de Lambda ze kan serveren indien de CDN ze mist.
+    #
+    # BELANGRIJK: grote media-mappen (photos/, images/, videos/, fonts/) worden NIET
+    # gekopieerd naar standalone. Ze worden uitsluitend via de CDN geserveerd vanuit
+    # .netlify/static/ (stap 3). Zo blijft de Lambda onder de 50 MB Netlify limiet.
     $standalonePub = Join-Path $projectRoot ".next\standalone\public"
+    # Mappen die te groot zijn voor de Lambda en via CDN geserveerd worden:
+    $excludeFromStandalone = @("photos", "images", "videos", "fonts", "uploads", "assets")
     if (Test-Path (Join-Path $projectRoot "public")) {
         if (-not (Test-Path $standalonePub)) {
             New-Item -ItemType Directory -Path $standalonePub -Force | Out-Null
         }
-        Copy-Item -Path (Join-Path $projectRoot "public\*") -Destination $standalonePub -Recurse -Force
+        # Kopieer alleen bestanden direct in public/ (geen mappen tenzij ze klein zijn)
+        Get-ChildItem -Path (Join-Path $projectRoot "public") -ErrorAction SilentlyContinue | ForEach-Object {
+            $item = $_
+            if ($item.PSIsContainer) {
+                # Sla grote media-mappen over
+                if ($excludeFromStandalone -contains $item.Name.ToLower()) {
+                    $skipSizeMB = [math]::Round((Get-ChildItem $item.FullName -Recurse -File -EA SilentlyContinue | Measure-Object Length -Sum).Sum / 1MB, 1)
+                    Write-Host ("  [2A-post] SKIP public\{0}\ ({1} MB) -> CDN only" -f $item.Name, $skipSizeMB) -ForegroundColor DarkYellow
+                } else {
+                    # Klein map - kopieer wel (bijv. icons/)
+                    $dest = Join-Path $standalonePub $item.Name
+                    Copy-Item -Path $item.FullName -Destination $dest -Recurse -Force
+                }
+            } else {
+                # Losse bestandjes (favicon.ico, robots.txt, og-image.png etc.)
+                Copy-Item -Path $item.FullName -Destination $standalonePub -Force
+            }
+        }
         $pubCount = (Get-ChildItem $standalonePub -Recurse -File -ErrorAction SilentlyContinue).Count
-        Write-Host "  [2A-post] public/ gekopieerd naar .next\standalone\public\ ($pubCount bestanden)" -ForegroundColor Green
+        Write-Host "  [2A-post] public/ (kleine assets) gekopieerd naar .next\standalone\public\ ($pubCount bestanden)" -ForegroundColor Green
     }
     Write-Host ""
 
@@ -329,8 +351,10 @@ if (-not $SkipBuild) {
     # --- 2B-strip: Verwijder grote mappen uit build-output (nooit de originals) ---
     # outputFileTracingExcludes blokkeert de primaire bron; dit is de vangnet-stap.
     # Alleen paden BINNEN .next\standalone\ en .netlify\functions-internal\ worden geraakt.
-    Write-Host "  [2B-strip] Strip lokale mappen uit build-output" -ForegroundColor DarkCyan
+    Write-Host "  [2B-strip] Strip lokale en media-mappen uit build-output" -ForegroundColor DarkCyan
     $stripDirs = @("data", "models", "scripts", "docs", "drizzle", ".git")
+    # Grote media-mappen die via CDN geserveerd worden, mogen NOOIT in de Lambda zitten:
+    $mediaStripDirs = @("photos", "images", "videos", "fonts", "uploads", "assets")
     $buildOutputRoots = @(
         (Join-Path $projectRoot ".next\standalone"),
         (Join-Path $projectRoot ".next\standalone\.next"),
@@ -339,6 +363,7 @@ if (-not $SkipBuild) {
     $stripped = $false
     foreach ($root in $buildOutputRoots) {
         if (-not (Test-Path $root)) { continue }
+        # Strip dev/data mappen
         foreach ($dir in $stripDirs) {
             $target = Join-Path $root $dir
             if (Test-Path $target) {
@@ -346,6 +371,18 @@ if (-not $SkipBuild) {
                 Remove-Item -Recurse -Force $target -ErrorAction SilentlyContinue
                 Write-Host ("  [2B-strip] {0} ({1} MB) uit {2}" -f $dir, $szMB, ($root.Replace($projectRoot + "\", ""))) -ForegroundColor DarkYellow
                 $stripped = $true
+            }
+        }
+        # Strip grote media-mappen zowel direct in root als genest in public/
+        foreach ($media in $mediaStripDirs) {
+            foreach ($mediaPath in @($media, "public\$media")) {
+                $target = Join-Path $root $mediaPath
+                if (Test-Path $target) {
+                    $szMB = [math]::Round((Get-ChildItem $target -Recurse -File -EA SilentlyContinue | Measure-Object Length -Sum).Sum / 1MB, 1)
+                    Remove-Item -Recurse -Force $target -ErrorAction SilentlyContinue
+                    Write-Host ("  [2B-strip] {0} ({1} MB) [CDN-only] uit {2}" -f $mediaPath, $szMB, ($root.Replace($projectRoot + "\", ""))) -ForegroundColor DarkYellow
+                    $stripped = $true
+                }
             }
         }
     }
@@ -480,11 +517,28 @@ Write-Host ""
 
 # --- Stap 4: Deploy pre-built ---
 Write-Host "Stap 4: Deploy pre-built (.netlify\static + .netlify\functions)" -ForegroundColor Yellow
-$deployLog = Join-Path $env:TEMP ("netlify-deploy-log-" + [Guid]::NewGuid().ToString("n") + ".txt")
-$deployCmd = 'cd /d "' + $projectRoot + '" && echo y | netlify deploy --prod --no-build --dir .netlify\static --functions .netlify\functions --skip-functions-cache > "' + $deployLog + '" 2>&1'
-cmd /c $deployCmd
-$deployOutputStr = Get-Content -Path $deployLog -Raw -ErrorAction SilentlyContinue
-Remove-Item -Path $deployLog -Force -ErrorAction SilentlyContinue
+
+# Unlock auto-publishing BEFORE deploying.
+# When a previous deploy was locked (stap 5), the next "netlify deploy --prod" will
+# show an interactive "Would you like to unlock?" prompt.  Piping "echo y |" via
+# cmd /c suppresses the prompt but also pipes a character into the Netlify Blobs
+# upload authentication flow, which causes a 401 error.
+# Unlocking explicitly via the API avoids the prompt entirely, so we can run the
+# deploy command directly in PowerShell without any stdin pipe.
+Write-Host "  [4-pre] Unlock auto-publishing (verwijder eventuele deploy lock)" -ForegroundColor DarkGray
+$siteId = "9341f8ad-20ab-43cc-a66b-3309f4b64405"
+$unlockResult = netlify api enableAutoPublishing --data "{`"site_id`":`"$siteId`"}" 2>&1
+if ($unlockResult -match '"name"') {
+    Write-Host "  [4-pre] OK: deploy ontgrendeld (auto-publishing ingeschakeld)" -ForegroundColor Green
+} else {
+    Write-Host "  [4-pre] WAARSCHUWING: unlock-resultaat onverwacht: $unlockResult" -ForegroundColor Yellow
+}
+
+# Run netlify deploy directly in PowerShell (no cmd /c, no stdin pipe).
+# Capturing $deployOutputStr by joining all output lines.
+Set-Location $projectRoot
+$deployRawOutput = netlify deploy --prod --no-build --dir ".netlify\static" --functions ".netlify\functions" --skip-functions-cache 2>&1
+$deployOutputStr = ($deployRawOutput | ForEach-Object { $_.ToString() }) -join "`n"
 
 if ([string]::IsNullOrWhiteSpace($deployOutputStr)) {
     Write-Host "ERROR: Geen deploy-output ontvangen" -ForegroundColor Red
